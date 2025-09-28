@@ -6,7 +6,7 @@ use thiserror::Error;
 #[error("Unexpected EOF")]
 pub struct UnexpectedEof;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token<'de> {
     pub origin: &'de str,
     pub offset: usize,

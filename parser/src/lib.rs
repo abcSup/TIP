@@ -1,40 +1,56 @@
-use lexer::{Lexer, Token, TokenKind};
+use std::default;
+
+use lexer::Lexer;
 use miette::LabeledSpan;
 
-#[derive(Debug)]
-pub enum TokenTree<'de> {
-    Function {
-        name: Token<'de>,
-        parameters: Vec<Token<'de>>,
-        declarations: Vec<Token<'de>>,
-        block: Box<TokenTree<'de>>,
-        return_stmt: Box<TokenTree<'de>>,
-    },
-    Call(Box<TokenTree<'de>>, Vec<TokenTree<'de>>),
-    Cons(Op, Vec<TokenTree<'de>>),
-    Equal(Box<TokenTree<'de>>, Box<TokenTree<'de>>),
-    Output(Box<TokenTree<'de>>),
-    Error(Box<TokenTree<'de>>),
-    If {
-        condition: Box<TokenTree<'de>>,
-        yes: Box<TokenTree<'de>>,
-        no: Option<Box<TokenTree<'de>>>,
-    },
-    While {
-        condition: Box<TokenTree<'de>>,
-        body: Box<TokenTree<'de>>,
-    },
-    Block(Vec<TokenTree<'de>>),
-    Atom(Atom<'de>),
+pub use lexer::{Token, TokenKind};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    pub functions: Vec<Function>,
 }
 
-#[derive(Debug)]
-pub enum Atom<'de> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Function {
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub declarations: Vec<String>,
+    pub block: Vec<Statement>,
+    pub return_stmt: Box<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Statement {
+    Assignment(Box<Expr>, Box<Expr>),
+    Output(Box<Expr>),
+    Error(Box<Expr>),
+    If {
+        condition: Box<Expr>,
+        yes: Box<Statement>,
+        no: Option<Box<Statement>>,
+    },
+    While {
+        condition: Box<Expr>,
+        body: Box<Statement>,
+    },
+    Block(Vec<Statement>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expr {
+    Unary(Op, Box<Expr>),
+    Binary(Op, Box<Expr>, Box<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
+    Atom(Atom),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Atom {
     Number(u64),
-    Ident(&'de str),
+    Ident(String),
     Record {
-        names: Vec<&'de str>,
-        values: Vec<TokenTree<'de>>,
+        names: Vec<String>,
+        values: Vec<Expr>,
     },
     Null,
     Input,
@@ -51,9 +67,20 @@ impl<'de> Parser<'de> {
         }
     }
 
+    pub fn parse(&mut self) -> Result<Program, miette::Error> {
+        self.parse_program()
+    }
+
     // Prog -> Fun ... Fun
-    pub fn parse_program(&mut self) -> Result<TokenTree<'de>, miette::Error> {
-        self.parse_function()
+    fn parse_program(&mut self) -> Result<Program, miette::Error> {
+        let mut functions = Vec::new();
+        loop {
+            functions.push(self.parse_function()?);
+            if self.lexer.peek().is_none() {
+                break;
+            }
+        }
+        Ok(Program { functions })
     }
 
     // Fun -> Id ( parameter_list ) {
@@ -61,7 +88,7 @@ impl<'de> Parser<'de> {
     //     Stm
     //     return Exp;
     //   }
-    pub fn parse_function(&mut self) -> Result<TokenTree<'de>, miette::Error> {
+    fn parse_function(&mut self) -> Result<Function, miette::Error> {
         let name = self.lexer.expect(TokenKind::Ident)?;
 
         self.lexer.expect(TokenKind::LParen)?;
@@ -74,8 +101,7 @@ impl<'de> Parser<'de> {
 
         let declarations = self.parse_var_block()?;
 
-        // let mut block = Vec::new();
-        let block = Box::new(self.parse_statement(false)?);
+        let block = self.parse_block_within()?;
 
         self.lexer.expect(TokenKind::Return)?;
 
@@ -85,8 +111,8 @@ impl<'de> Parser<'de> {
 
         self.lexer.expect(TokenKind::RCurly)?;
 
-        Ok(TokenTree::Function {
-            name,
+        Ok(Function {
+            name: name.origin.to_owned(),
             parameters,
             declarations,
             block,
@@ -95,7 +121,7 @@ impl<'de> Parser<'de> {
     }
 
     // Id, ..., Id
-    fn parse_parameter_list(&mut self) -> Result<Vec<Token<'de>>, miette::Error> {
+    fn parse_parameter_list(&mut self) -> Result<Vec<String>, miette::Error> {
         let mut parameters = Vec::new();
         if matches!(
             self.lexer.peek(),
@@ -105,7 +131,8 @@ impl<'de> Parser<'de> {
             })
         ) {
             loop {
-                parameters.push(self.lexer.expect(TokenKind::Ident)?);
+                let ident = self.lexer.expect(TokenKind::Ident)?;
+                parameters.push(ident.origin.to_owned());
 
                 if !matches!(
                     self.lexer.peek(),
@@ -126,7 +153,7 @@ impl<'de> Parser<'de> {
     // VarBlock ->
     //  | VarBlock VarBlock
     //  | var Id (, Id)+;
-    fn parse_var_block(&mut self) -> Result<Vec<Token<'de>>, miette::Error> {
+    fn parse_var_block(&mut self) -> Result<Vec<String>, miette::Error> {
         let mut variables = Vec::new();
         loop {
             if !matches!(
@@ -142,7 +169,8 @@ impl<'de> Parser<'de> {
             self.lexer.expect(TokenKind::Var)?;
 
             loop {
-                variables.push(self.lexer.expect(TokenKind::Ident)?);
+                let ident = self.lexer.expect(TokenKind::Ident)?;
+                variables.push(ident.origin.to_owned());
 
                 if !matches!(
                     self.lexer.peek(),
@@ -162,6 +190,54 @@ impl<'de> Parser<'de> {
         Ok(variables)
     }
 
+    fn parse_block(&mut self) -> Result<Statement, miette::Error> {
+        self.lexer.expect(TokenKind::LCurly)?;
+
+        let body = self.parse_block_within()?;
+
+        self.lexer.expect(TokenKind::RCurly)?;
+
+        Ok(Statement::Block(body))
+    }
+
+    fn parse_block_within(&mut self) -> Result<Vec<Statement>, miette::Error> {
+        let mut statements = Vec::new();
+        loop {
+            let stmt = self.parse_statement();
+            match stmt {
+                Ok(stmt) => statements.push(stmt),
+                Err(_) => match self.lexer.peek() {
+                    Some(Token {
+                        kind: TokenKind::LCurly,
+                        ..
+                    }) => {
+                        statements.push(self.parse_block()?);
+                    }
+                    Some(Token {
+                        kind: TokenKind::Return | TokenKind::RCurly,
+                        ..
+                    }) => break,
+                    Some(token) => {
+                        return Err(miette::miette!(
+                            labels = vec![LabeledSpan::at(
+                                token.offset..token.offset + token.origin.len(),
+                                "here"
+                            )],
+                            help = format!("Expected a Return or RCurly, found {:?}", token.kind),
+                            "Unexpected token"
+                        )
+                        .with_source_code(self.lexer.whole.to_string()));
+                    }
+                    None => {
+                        return Err(miette::miette!("Unexpected EOF"));
+                    }
+                },
+            };
+        }
+
+        Ok(statements)
+    }
+
     // Stm -> Id = Exp;
     //  | output Exp;
     //  | error Exp;
@@ -171,263 +247,193 @@ impl<'de> Parser<'de> {
     //  | *Exp = Exp;
     //  | Id.Id = Exp;
     //  | (*Exp).Id = Exp;
-    fn parse_statement(&mut self, single: bool) -> Result<TokenTree<'de>, miette::Error> {
-        let mut statements = Vec::new();
-        loop {
-            // TODO: remove panic here
-            let stmt = match self.lexer.peek().unwrap() {
-                // Id = Exp;
-                // Id.Id = Exp;
-                Token {
-                    kind: TokenKind::Ident,
+    fn parse_statement(&mut self) -> Result<Statement, miette::Error> {
+        // TODO: remove panic here
+        let statement = match self.lexer.peek().unwrap() {
+            // Id = Exp;
+            // Id.Id = Exp;
+            Token {
+                kind: TokenKind::Ident,
+                ..
+            } => {
+                let var = self.lexer.expect(TokenKind::Ident)?;
+
+                self.lexer.expect(TokenKind::Equal)?;
+
+                let lhs = match self.lexer.peek() {
+                    Some(Token {
+                        kind: TokenKind::Dot,
+                        ..
+                    }) => {
+                        self.lexer.expect(TokenKind::Dot)?;
+
+                        let field = self.lexer.expect(TokenKind::Ident)?;
+
+                        Expr::Binary(
+                            Op::Dot,
+                            Box::new(Expr::Atom(Atom::Ident(var.origin.to_owned()))),
+                            Box::new(Expr::Atom(Atom::Ident(field.origin.to_owned()))),
+                        )
+                    }
+                    _ => Expr::Atom(Atom::Ident(var.origin.to_owned())),
+                };
+
+                let rhs = self.parse_expression(0)?;
+
+                self.lexer.expect(TokenKind::Semicolon)?;
+
+                Statement::Assignment(Box::new(lhs), Box::new(rhs))
+            }
+            // output Exp;
+            Token {
+                kind: TokenKind::Output,
+                ..
+            } => {
+                self.lexer.expect(TokenKind::Output)?;
+
+                let lhs = self.parse_expression(0)?;
+
+                self.lexer.expect(TokenKind::Semicolon)?;
+
+                Statement::Output(Box::new(lhs))
+            }
+            // error Exp;
+            Token {
+                kind: TokenKind::Error,
+                ..
+            } => {
+                self.lexer.expect(TokenKind::Error)?;
+
+                let lhs = self.parse_expression(0)?;
+
+                self.lexer.expect(TokenKind::Semicolon)?;
+
+                Statement::Error(Box::new(lhs))
+            }
+            // if (Exp) { Stm } [else { Stm }]?
+            Token {
+                kind: TokenKind::If,
+                ..
+            } => {
+                self.lexer.expect(TokenKind::If)?;
+
+                self.lexer.expect(TokenKind::LParen)?;
+
+                let condition = Box::new(self.parse_expression(0)?);
+
+                self.lexer.expect(TokenKind::RParen)?;
+
+                let yes = if let Some(Token {
+                    kind: TokenKind::LCurly,
                     ..
-                } => {
-                    let var = self.lexer.expect(TokenKind::Ident)?;
+                }) = self.lexer.peek()
+                {
+                    self.parse_block()?
+                } else {
+                    self.parse_statement()?
+                };
+                let yes = Box::new(yes);
 
-                    self.lexer.expect(TokenKind::Equal)?;
-
-                    let lhs = match self.lexer.peek() {
-                        Some(Token {
-                            kind: TokenKind::Dot,
-                            ..
-                        }) => {
-                            self.lexer.expect(TokenKind::Dot)?;
-
-                            let field = self.lexer.expect(TokenKind::Ident)?;
-
-                            TokenTree::Cons(
-                                Op::Dot,
-                                vec![
-                                    TokenTree::Atom(Atom::Ident(var.origin)),
-                                    TokenTree::Atom(Atom::Ident(field.origin)),
-                                ],
-                            )
-                        }
-                        _ => TokenTree::Atom(Atom::Ident(var.origin)),
-                        // TODO: Eof?
-                    };
-
-                    let rhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::Semicolon)?;
-
-                    TokenTree::Equal(Box::new(lhs), Box::new(rhs))
-                }
-                // output Exp;
-                Token {
-                    kind: TokenKind::Output,
+                // else statements
+                let no = if let Some(Token {
+                    kind: TokenKind::Else,
                     ..
-                } => {
-                    self.lexer.expect(TokenKind::Output)?;
+                }) = self.lexer.peek()
+                {
+                    self.lexer.expect(TokenKind::Else)?;
 
-                    let lhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::Semicolon)?;
-
-                    TokenTree::Output(Box::new(lhs))
-                }
-                // error Exp;
-                Token {
-                    kind: TokenKind::Error,
-                    ..
-                } => {
-                    self.lexer.expect(TokenKind::Error)?;
-
-                    let lhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::Semicolon)?;
-
-                    TokenTree::Error(Box::new(lhs))
-                }
-                // if (Exp) { Stm } [else { Stm }]?
-                Token {
-                    kind: TokenKind::If,
-                    ..
-                } => {
-                    self.lexer.expect(TokenKind::If)?;
-
-                    self.lexer.expect(TokenKind::LParen)?;
-
-                    let condition = Box::new(self.parse_expression(0)?);
-
-                    self.lexer.expect(TokenKind::RParen)?;
-
-                    let yes = if let Some(Token {
+                    let no = if let Some(Token {
                         kind: TokenKind::LCurly,
                         ..
                     }) = self.lexer.peek()
                     {
-                        self.lexer.expect(TokenKind::LCurly)?;
-
-                        let yes = Box::new(self.parse_statement(false)?);
-
-                        self.lexer.expect(TokenKind::RCurly)?;
-
-                        yes
+                        self.parse_block()?
                     } else {
-                        Box::new(self.parse_statement(true)?)
+                        self.parse_statement()?
                     };
 
-                    // else statements
-                    let no = if let Some(Token {
-                        kind: TokenKind::Else,
-                        ..
-                    }) = self.lexer.peek()
-                    {
-                        self.lexer.expect(TokenKind::Else)?;
+                    Some(Box::new(no))
+                } else {
+                    None
+                };
 
-                        let no = if let Some(Token {
-                            kind: TokenKind::LCurly,
-                            ..
-                        }) = self.lexer.peek()
-                        {
-                            self.lexer.expect(TokenKind::LCurly)?;
+                Statement::If { condition, yes, no }
+            },
+            // while (Exp) { Stm }
+            Token {
+                kind: TokenKind::While,
+                ..
+            } => {
+                self.lexer.expect(TokenKind::While)?;
 
-                            let block = self.parse_statement(false)?;
+                self.lexer.expect(TokenKind::LParen)?;
 
-                            self.lexer.expect(TokenKind::RCurly)?;
+                let condition = Box::new(self.parse_expression(0)?);
 
-                            block
-                        } else {
-                            self.parse_statement(true)?
-                        };
+                self.lexer.expect(TokenKind::RParen)?;
 
-                        Some(Box::new(no))
-                    } else {
-                        None
-                    };
+                let body = Box::new(self.parse_block()?);
 
-                    // else statements
-                    // let no = match self.lexer.peek() {
-                    //     Some(Token {
-                    //         kind: TokenKind::Else,
-                    //         ..
-                    //     }) => {
-                    //         self.lexer.expect(TokenKind::Else)?;
-
-                    //         self.lexer.expect(TokenKind::LCurly)?;
-
-                    //         let no = self.parse_statement(false)?;
-
-                    //         self.lexer.expect(TokenKind::RCurly)?;
-
-                    //         Some(Box::new(no))
-                    //     }
-                    //     _ => None,
-                    // };
-
-                    TokenTree::If { condition, yes, no }
-                }
-                // while (Exp) { Stm }
-                Token {
-                    kind: TokenKind::While,
-                    ..
-                } => {
-                    self.lexer.expect(TokenKind::While)?;
-
-                    self.lexer.expect(TokenKind::LParen)?;
-
-                    let condition = Box::new(self.parse_expression(0)?);
-
-                    self.lexer.expect(TokenKind::RParen)?;
-
-                    self.lexer.expect(TokenKind::LCurly)?;
-
-                    let body = Box::new(self.parse_statement(false)?);
-
-                    self.lexer.expect(TokenKind::RCurly)?;
-
-                    TokenTree::While { condition, body }
-                }
-                // *Exp = Exp;
-                Token {
-                    kind: TokenKind::Star,
-                    ..
-                } => {
-                    let lhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::Equal)?;
-
-                    let rhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::Semicolon)?;
-
-                    TokenTree::Equal(
-                        Box::new(TokenTree::Cons(Op::Star, vec![lhs])),
-                        Box::new(rhs),
-                    )
-                }
-                // (*Exp).Id = Exp;
-                Token {
-                    kind: TokenKind::LParen,
-                    ..
-                } => {
-                    self.lexer.expect(TokenKind::Star)?;
-
-                    let lhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::RParen)?;
-
-                    self.lexer.expect(TokenKind::Dot)?;
-
-                    let field = self.lexer.expect(TokenKind::Ident)?;
-
-                    self.lexer.expect(TokenKind::Equal)?;
-
-                    let rhs = self.parse_expression(0)?;
-
-                    self.lexer.expect(TokenKind::Semicolon)?;
-
-                    TokenTree::Equal(
-                        Box::new(TokenTree::Cons(
-                            Op::Dot,
-                            vec![
-                                TokenTree::Cons(Op::Star, vec![lhs]),
-                                TokenTree::Atom(Atom::Ident(field.origin)),
-                            ],
-                        )),
-                        Box::new(rhs),
-                    )
-                }
-                // { Stmt, ..., Stmt }
-                // Note: This is not in the spec, but appears in examples
-                Token {
-                    kind: TokenKind::LCurly,
-                    ..
-                } => {
-                    self.lexer.expect(TokenKind::LCurly)?;
-
-                    let body = self.parse_statement(false)?;
-
-                    self.lexer.expect(TokenKind::RCurly)?;
-
-                    body
-                }
-                Token {
-                    kind: TokenKind::Return | TokenKind::RCurly,
-                    ..
-                } => break,
-                token => {
-                    return Err(miette::miette!(
-                        labels = vec![LabeledSpan::at(
-                            token.offset..token.offset + token.origin.len(),
-                            "here"
-                        )],
-                        help = "Expected a statement",
-                        "Unexpected token"
-                    )
-                    .with_source_code(self.lexer.whole.to_string()));
-                }
-            };
-
-            statements.push(stmt);
-
-            if single {
-                break;
+                Statement::While { condition, body }
             }
-        }
+            // *Exp = Exp;
+            Token {
+                kind: TokenKind::Star,
+                ..
+            } => {
+                let pointer = self.parse_expression(0)?;
 
-        Ok(TokenTree::Block(statements))
+                self.lexer.expect(TokenKind::Equal)?;
+
+                let rhs = self.parse_expression(0)?;
+
+                self.lexer.expect(TokenKind::Semicolon)?;
+
+                Statement::Assignment(Box::new(pointer), Box::new(rhs))
+            }
+            // (*Exp).Id = Exp;
+            Token {
+                kind: TokenKind::LParen,
+                ..
+            } => {
+                self.lexer.expect(TokenKind::Star)?;
+
+                let pointer = self.parse_expression(0)?;
+
+                self.lexer.expect(TokenKind::RParen)?;
+
+                self.lexer.expect(TokenKind::Dot)?;
+
+                let field = self.lexer.expect(TokenKind::Ident)?;
+
+                let lhs = Expr::Binary(
+                    Op::Dot,
+                    Box::new(Expr::Unary(Op::Star, Box::new(pointer))),
+                    Box::new(Expr::Atom(Atom::Ident(field.origin.to_owned()))),
+                );
+
+                self.lexer.expect(TokenKind::Equal)?;
+
+                let rhs = self.parse_expression(0)?;
+
+                self.lexer.expect(TokenKind::Semicolon)?;
+
+                Statement::Assignment(Box::new(lhs), Box::new(rhs))
+            }
+            token => {
+                return Err(miette::miette!(
+                    labels = vec![LabeledSpan::at(
+                        token.offset..token.offset + token.origin.len(),
+                        "here"
+                    )],
+                    help = "Expected a statement",
+                    "Unexpected token"
+                )
+                .with_source_code(self.lexer.whole.to_string()));
+            }
+        };
+
+        Ok(statement)
     }
 
     // Exp -> Int
@@ -443,20 +449,20 @@ impl<'de> Parser<'de> {
     //  | { Id:Exp, …, Id:Exp }
     //  | Exp.Id
     //  | Exp( Exp, ..., Exp )
-    fn parse_expression(&mut self, min_bp: u8) -> Result<TokenTree<'de>, miette::Error> {
+    fn parse_expression(&mut self, min_bp: u8) -> Result<Expr, miette::Error> {
         // TODO: remove panic
         let mut lhs = match self.lexer.next().unwrap() {
             // Int
             Token {
                 kind: TokenKind::Number(value),
                 ..
-            } => TokenTree::Atom(Atom::Number(value)),
+            } => Expr::Atom(Atom::Number(value)),
             // Id
             Token {
                 origin: ident,
                 kind: TokenKind::Ident,
                 ..
-            } => TokenTree::Atom(Atom::Ident(ident)),
+            } => Expr::Atom(Atom::Ident(ident.to_owned())),
             // ( Exp )
             Token {
                 kind: TokenKind::LParen,
@@ -464,20 +470,20 @@ impl<'de> Parser<'de> {
             } => {
                 let lhs = self.parse_expression(0)?;
                 self.lexer.expect(TokenKind::RParen)?;
-                TokenTree::Cons(Op::Group, vec![lhs])
+                lhs
             }
             // input
             Token {
                 kind: TokenKind::Input,
                 ..
-            } => TokenTree::Atom(Atom::Input),
+            } => Expr::Atom(Atom::Input),
             // alloc Exp
             Token {
                 kind: TokenKind::Alloc,
                 ..
             } => {
                 let lhs = self.parse_expression(0)?;
-                TokenTree::Cons(Op::Alloc, vec![lhs])
+                Expr::Unary(Op::Alloc, Box::new(lhs))
             }
             // unary
             // &Id
@@ -486,9 +492,9 @@ impl<'de> Parser<'de> {
                 ..
             } => {
                 let ident = self.lexer.expect(TokenKind::Ident)?;
-                TokenTree::Cons(
+                Expr::Unary(
                     Op::Ampersand,
-                    vec![TokenTree::Atom(Atom::Ident(ident.origin))],
+                    Box::new(Expr::Atom(Atom::Ident(ident.origin.to_owned()))),
                 )
             }
             // *Exp
@@ -497,7 +503,7 @@ impl<'de> Parser<'de> {
                 ..
             } => {
                 let lhs = self.parse_expression(0)?;
-                TokenTree::Cons(Op::Star, vec![lhs])
+                Expr::Unary(Op::Star, Box::new(lhs))
             }
             // -Expr
             Token {
@@ -506,13 +512,13 @@ impl<'de> Parser<'de> {
             } => {
                 let ((), r_bp) = prefix_binding_power(Op::Minus);
                 let rhs = self.parse_expression(r_bp)?;
-                TokenTree::Cons(Op::Minus, vec![rhs])
+                Expr::Unary(Op::Minus, Box::new(rhs))
             }
             // null
             Token {
                 kind: TokenKind::Null,
                 ..
-            } => TokenTree::Atom(Atom::Null),
+            } => Expr::Atom(Atom::Null),
             // { Id:Exp, ..., Id:Exp }
             Token {
                 kind: TokenKind::LCurly,
@@ -522,17 +528,17 @@ impl<'de> Parser<'de> {
                 let mut values = Vec::new();
 
                 loop {
-                    let name = self.lexer.expect(TokenKind::Ident)?;
+                    let ident = self.lexer.expect(TokenKind::Ident)?;
 
                     self.lexer.expect(TokenKind::Colon)?;
 
                     let value = self.parse_expression(0)?;
 
                     // Field value cannot be a Record
-                    if let TokenTree::Atom(Atom::Record { .. }) = value {
+                    if let Expr::Atom(Atom::Record { .. }) = value {
                         return Err(miette::miette!(
                             labels = vec![LabeledSpan::at(
-                                name.offset..name.offset + name.origin.len(),
+                                ident.offset..ident.offset + ident.origin.len(),
                                 "here"
                             )],
                             "Field value cannot be a Record"
@@ -540,7 +546,7 @@ impl<'de> Parser<'de> {
                         .with_source_code(self.lexer.whole.to_string()));
                     }
 
-                    names.push(name.origin);
+                    names.push(ident.origin.to_owned());
                     values.push(value);
 
                     if !matches!(
@@ -556,7 +562,7 @@ impl<'de> Parser<'de> {
                 }
                 self.lexer.expect(TokenKind::RCurly)?;
 
-                TokenTree::Atom(Atom::Record { names, values })
+                Expr::Atom(Atom::Record { names, values })
             }
             token => {
                 return Err(miette::miette!(
@@ -638,25 +644,37 @@ impl<'de> Parser<'de> {
                 lhs = match op {
                     Op::Dot => {
                         let ident = self.lexer.expect(TokenKind::Ident)?;
-                        TokenTree::Cons(op, vec![TokenTree::Atom(Atom::Ident(ident.origin))])
+                        Expr::Binary(
+                            Op::Dot,
+                            Box::new(lhs),
+                            Box::new(Expr::Atom(Atom::Ident(ident.origin.to_owned()))),
+                        )
                     }
                     Op::Call => {
                         let mut args = Vec::new();
-                        loop {
-                            args.push(self.parse_expression(0)?);
-                            if !matches!(
-                                self.lexer.peek(),
-                                Some(Token {
-                                    kind: TokenKind::Comma,
-                                    ..
-                                })
-                            ) {
-                                break;
+                        if !matches!(
+                            self.lexer.peek(),
+                            Some(Token {
+                                kind: TokenKind::RParen,
+                                ..
+                            })
+                        ) {
+                            loop {
+                                args.push(self.parse_expression(0)?);
+                                if !matches!(
+                                    self.lexer.peek(),
+                                    Some(Token {
+                                        kind: TokenKind::Comma,
+                                        ..
+                                    })
+                                ) {
+                                    break;
+                                }
+                                self.lexer.expect(TokenKind::Comma)?;
                             }
-                            self.lexer.expect(TokenKind::Comma)?;
                         }
                         self.lexer.expect(TokenKind::RParen)?;
-                        TokenTree::Call(Box::new(lhs), args)
+                        Expr::Call(Box::new(lhs), args)
                     }
                     _ => unreachable!(),
                 };
@@ -674,7 +692,7 @@ impl<'de> Parser<'de> {
 
                 let rhs = self.parse_expression(r_bp)?;
 
-                lhs = TokenTree::Cons(op, vec![lhs, rhs]);
+                lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
                 continue;
             }
 
@@ -695,10 +713,8 @@ pub enum Op {
     EqualEqual,
     Dot,
     Call,
-    Group,
     Alloc,
     Ampersand,
-    Output,
 }
 
 // -Expr
